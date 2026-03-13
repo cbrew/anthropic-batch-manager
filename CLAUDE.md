@@ -6,10 +6,8 @@ Task graph batch compiler for the Anthropic Batch API. Compiles DAGs of LLM task
 
 ## Rules
 
-- Never claim something is impossible, requires a large change, or "would need X" without first checking the SDK, docs, or codebase. If you don't know, look it up. Do not speculate about API capabilities.
-- When working with the Anthropic SDK: check the installed version, read the actual type definitions or official docs. Do not guess at what parameters exist or what the API supports.
-- Do not str() structured objects (errors, responses, SDK types) to flatten them into strings. Extract the specific fields you need.
-- Check the Anthropic docs (platform.claude.com/docs) for current API features before making claims about what is or isn't supported.
+- Don't make claims that are irrelevant. Stay focused on doing the work. Don't editorialize about difficulty, feasibility, or what "would be needed" — just look it up and do it.
+- Don't take shortcuts. Read the docs (platform.claude.com/docs), check the installed SDK version, read actual type definitions. Don't guess, don't str() structured objects, don't assume you know what an API supports.
 
 ## Test commands
 
