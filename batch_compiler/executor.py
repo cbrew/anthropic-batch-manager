@@ -128,6 +128,13 @@ class Executor:
             params["system"] = task.system
         if task.temperature is not None:
             params["temperature"] = task.temperature
+        if task.output_schema is not None:
+            params["output_config"] = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": task.output_schema,
+                }
+            }
         return params
 
     async def _run_llm_level(

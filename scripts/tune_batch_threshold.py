@@ -34,10 +34,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = (
-    "You are a classification assistant. Respond with valid JSON only. "
-    'Use this schema: {"label": string, "confidence": number, "reasoning": string}'
-)
+SYSTEM_PROMPT = "You are a classification assistant."
+
+# JSON schema for structured output — enforced by the API, not the prompt.
+CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {"type": "string", "description": "The classification label"},
+        "confidence": {"type": "number", "description": "Confidence score 0.0 to 1.0"},
+        "reasoning": {"type": "string", "description": "Brief explanation"},
+    },
+    "required": ["label", "confidence", "reasoning"],
+    "additionalProperties": False,
+}
 
 # Each task gets a unique prompt from this list (cycled). These are varied
 # enough to avoid prompt caching giving us unrealistic numbers.
@@ -87,6 +96,7 @@ async def run_trial(
             max_tokens=256,
             system=SYSTEM_PROMPT,
             temperature=0.0,
+            output_schema=CLASSIFICATION_SCHEMA,
             prompt=prompt,
         ))
 
