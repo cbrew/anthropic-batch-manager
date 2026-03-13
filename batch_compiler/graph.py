@@ -116,12 +116,15 @@ class TaskGraph:
         self,
         client: Any | None = None,
         max_batch_size: int = 100_000,
+        batch_threshold: int = 10,
     ) -> dict[str, Any]:
         """Compile and execute the graph.
 
         Args:
             client: Optional anthropic.AsyncAnthropic client instance.
             max_batch_size: Max requests per Anthropic batch (default 100k).
+            batch_threshold: Use individual async calls below this count,
+                batch API at or above it (default 10).
 
         Returns:
             Dict mapping task_id -> TaskResult.
@@ -134,5 +137,6 @@ class TaskGraph:
             plan=plan,
             client=client,
             max_batch_size=max_batch_size,
+            batch_threshold=batch_threshold,
         )
         return await executor.run()

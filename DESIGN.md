@@ -52,16 +52,18 @@ The executor processes the graph **level by level**. Within each level, all
 tasks have their dependencies satisfied by prior levels:
 
 ```
-Level 0:  [task_a, task_b, task_c]   ← all independent → one Batch API call
-Level 1:  [task_d, task_e]           ← depend on level-0 → second Batch call
-Level 2:  [task_f]                   ← depends on level-1 → third Batch call
+Level 0:  [task_a, task_b, task_c]   ← all independent
+Level 1:  [task_d, task_e]           ← depend on level-0
+Level 2:  [task_f]                   ← depends on level-1
 ```
 
 Within each level:
 - PyTasks run **sequentially** first (fast glue code).
-- All LLM tasks are submitted as Anthropic batch(es), automatically
-  **chunked** to stay within the API limit of 100k requests per batch.
-- The level completes when all batches and PyTasks finish.
+- **< 10 LLM tasks**: fired as concurrent individual `messages.create` calls
+  (avoids Batch API overhead for small workloads).
+- **≥ 10 LLM tasks**: submitted via the Batch API, automatically **chunked**
+  to stay within the API limit of 100k requests per batch.
+- The level completes when all calls finish.
 
 ---
 
@@ -204,12 +206,12 @@ batch_compiler/
 
 ## Key Design Decisions
 
-### 1. Level-based execution with chunking
+### 1. Adaptive dispatch: individual calls vs Batch API
 
-The graph executes level by level. All LLM tasks in a level are submitted as
-Anthropic batch(es). If a level has more than 100k tasks, the executor
-automatically chunks them into multiple batches. This maximizes the number of
-requests per batch (better throughput) while respecting API limits.
+Small levels (< 10 LLM tasks) use concurrent `messages.create` calls — lower
+latency, no polling overhead. Larger levels use the Batch API for throughput,
+automatically chunked into groups of ≤ 100k to respect API limits. The
+threshold (default 10) is configurable via `batch_threshold`.
 
 ### 2. Sequential PyTasks
 
