@@ -79,6 +79,7 @@ def load_yaml(path: str, variables: dict[str, Any]) -> TaskGraph:
                         max_tokens=defn.get("max_tokens", defaults.get("max_tokens", 1024)),
                         system=defn.get("system", defaults.get("system")),
                         temperature=defn.get("temperature", defaults.get("temperature")),
+                        output_schema=defn.get("output_schema", defaults.get("output_schema")),
                         deps=deps,
                     ))
         else:
@@ -98,6 +99,7 @@ def load_yaml(path: str, variables: dict[str, Any]) -> TaskGraph:
                     max_tokens=defn.get("max_tokens", defaults.get("max_tokens", 1024)),
                     system=defn.get("system", defaults.get("system")),
                     temperature=defn.get("temperature", defaults.get("temperature")),
+                    output_schema=defn.get("output_schema", defaults.get("output_schema")),
                     deps=deps,
                 ))
 

@@ -17,6 +17,7 @@ class LLMTask:
     prompt_template: str | None = None
     system: str | None = None
     temperature: float | None = None
+    output_schema: dict[str, Any] | None = None
     deps: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:

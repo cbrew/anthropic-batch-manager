@@ -4,6 +4,10 @@
 Sweeps across task counts and threshold values to measure the wall-clock and
 token-cost tradeoffs between the individual-call path and the batch-API path.
 
+Each task uses a realistic prompt: a system message, a unique user message
+(to avoid prompt caching across tasks), and a max_tokens budget that allows
+a meaningful response.
+
 Requires ANTHROPIC_API_KEY in the environment.
 
 Usage:
@@ -30,8 +34,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Cheap, deterministic prompt that still exercises the full path.
-PROMPT = "Reply with exactly one word: the color of the sky."
+SYSTEM_PROMPT = "You are a classification assistant."
+
+# JSON schema for structured output — enforced by the API, not the prompt.
+CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {"type": "string", "description": "The classification label"},
+        "confidence": {"type": "number", "description": "Confidence score 0.0 to 1.0"},
+        "reasoning": {"type": "string", "description": "Brief explanation"},
+    },
+    "required": ["label", "confidence", "reasoning"],
+    "additionalProperties": False,
+}
+
+# Each task gets a unique prompt from this list (cycled). These are varied
+# enough to avoid prompt caching giving us unrealistic numbers.
+TASK_PROMPTS = [
+    "Classify the sentiment of this product review: 'The battery life is incredible but the screen is too dim outdoors.'",
+    "Classify the intent of this support ticket: 'I was charged twice for my subscription last month and need a refund.'",
+    "Classify the topic of this news headline: 'Central bank raises interest rates for the fifth consecutive quarter.'",
+    "Classify the urgency of this message: 'Server CPU at 98% for the last 30 minutes, response times degrading.'",
+    "Classify the sentiment of this employee feedback: 'The new remote work policy is flexible but the communication tools are frustrating.'",
+    "Classify the intent of this search query: 'how to cancel auto-renewal on annual plan'",
+    "Classify the topic of this abstract: 'We present a novel transformer architecture that reduces attention complexity from quadratic to linear.'",
+    "Classify the urgency of this alert: 'Disk usage on prod-db-03 reached 85%, projected to fill in 72 hours.'",
+    "Classify the sentiment of this app review: 'Crashes every time I try to upload a photo. Worked fine until the last update.'",
+    "Classify the intent of this email subject: 'Partnership opportunity - enterprise data analytics platform'",
+    "Classify the topic of this passage: 'The phase III trial enrolled 2,400 participants across 15 sites and met its primary endpoint.'",
+    "Classify the urgency of this bug report: 'Login button unresponsive on Safari 17. Users can work around by using Chrome.'",
+]
 
 
 @dataclass
@@ -55,11 +87,17 @@ async def run_trial(
     """Build a flat fan-out of n_tasks, run with the given threshold."""
     graph = TaskGraph()
     for i in range(n_tasks):
+        prompt = TASK_PROMPTS[i % len(TASK_PROMPTS)]
+        # Append task index to make each prompt unique (defeats caching)
+        prompt = f"[Task {i}] {prompt}"
         graph.add(LLMTask(
             id=f"t{i}",
             model=model,
-            max_tokens=16,
-            prompt=PROMPT,
+            max_tokens=256,
+            system=SYSTEM_PROMPT,
+            temperature=0.0,
+            output_schema=CLASSIFICATION_SCHEMA,
+            prompt=prompt,
         ))
 
     t0 = time.monotonic()
