@@ -2,7 +2,7 @@
 
 import pytest
 
-from batch_compiler.task import LLMTask, PyTask, TaskResult
+from batch_compiler.task import LLMTask, PyTask, TaskError, TaskResult
 
 
 class TestLLMTask:
@@ -50,10 +50,15 @@ class TestTaskResult:
         assert r.error is None
 
     def test_errored(self):
-        r = TaskResult(task_id="t1", status="errored", error="API failure")
+        err = TaskError(type="api_error", message="API failure")
+        r = TaskResult(task_id="t1", status="errored", error=err)
         assert r.status == "errored"
         assert r.content is None
+        assert r.error.type == "api_error"
+        assert r.error.message == "API failure"
+        assert str(r.error) == "api_error: API failure"
 
     def test_skipped(self):
-        r = TaskResult(task_id="t1", status="skipped", error="Dep failed")
+        err = TaskError(type="dependency_failed", message="Dep failed")
+        r = TaskResult(task_id="t1", status="skipped", error=err)
         assert r.status == "skipped"

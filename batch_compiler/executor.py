@@ -11,7 +11,7 @@ import anthropic
 from .batch_client import BatchClient
 from .compiler import ExecutionPlan
 from .errors import TemplateError
-from .task import LLMTask, PyTask, TaskResult
+from .task import LLMTask, PyTask, TaskError, TaskResult
 from .template import render_template
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ class Executor:
                     self._resolved[tid] = TaskResult(
                         task_id=tid,
                         status="skipped",
-                        error="Dependency failed",
+                        error=TaskError(type="dependency_failed", message="Dependency failed"),
                     )
                     continue
 
@@ -109,9 +109,11 @@ class Executor:
             )
             self._resolved_content[task_id] = content
         except Exception as e:
-            logger.error("PyTask %s failed: %s", task_id, e)
+            logger.error("PyTask %s failed (%s): %s", task_id, type(e).__name__, e)
             self._resolved[task_id] = TaskResult(
-                task_id=task_id, status="errored", error=str(e)
+                task_id=task_id,
+                status="errored",
+                error=TaskError(type=type(e).__name__, message=str(e)),
             )
 
     def _build_params(self, task: LLMTask) -> dict[str, Any]:
@@ -141,7 +143,9 @@ class Executor:
             except TemplateError as e:
                 logger.error("Template error for task %s: %s", tid, e)
                 self._resolved[tid] = TaskResult(
-                    task_id=tid, status="errored", error=str(e)
+                    task_id=tid,
+                    status="errored",
+                    error=TaskError(type="template_error", message=str(e)),
                 )
                 continue
             prepared.append((tid, params))
@@ -154,6 +158,21 @@ class Executor:
         else:
             await self._run_llm_batched(prepared)
 
+    def _extract_text(self, message) -> str:
+        """Extract text content from a Message, handling non-text block types."""
+        if not message.content:
+            return ""
+        texts = []
+        for block in message.content:
+            if hasattr(block, "text"):
+                texts.append(block.text)
+            else:
+                logger.warning(
+                    "Skipping non-text content block of type %s",
+                    getattr(block, "type", type(block).__name__),
+                )
+        return "\n".join(texts)
+
     async def _run_llm_individual(
         self, prepared: list[tuple[str, dict[str, Any]]]
     ) -> None:
@@ -163,9 +182,14 @@ class Executor:
         async def call_one(tid: str, params: dict[str, Any]) -> None:
             try:
                 message = await self._client.messages.create(**params)
-                content = ""
-                if message.content:
-                    content = message.content[0].text
+                content = self._extract_text(message)
+                stop_reason = message.stop_reason
+
+                if stop_reason == "refusal":
+                    logger.warning("Task %s: model refused to respond", tid)
+                elif stop_reason == "max_tokens":
+                    logger.warning("Task %s: output truncated (max_tokens)", tid)
+
                 usage_dict = None
                 if message.usage:
                     usage_dict = {
@@ -176,13 +200,25 @@ class Executor:
                     task_id=tid,
                     status="succeeded",
                     content=content,
+                    stop_reason=stop_reason,
                     usage=usage_dict,
                 )
                 self._resolved_content[tid] = content
+            except anthropic.AuthenticationError as e:
+                logger.error("Authentication failed for task %s: %s", tid, e)
+                raise  # fatal, don't swallow
+            except anthropic.PermissionDeniedError as e:
+                logger.error("Permission denied for task %s: %s", tid, e)
+                raise  # fatal, don't swallow
             except Exception as e:
-                logger.error("LLM call for task %s failed: %s", tid, e)
+                logger.error(
+                    "LLM call for task %s failed (%s): %s",
+                    tid, type(e).__name__, e,
+                )
                 self._resolved[tid] = TaskResult(
-                    task_id=tid, status="errored", error=str(e)
+                    task_id=tid,
+                    status="errored",
+                    error=TaskError(type=type(e).__name__, message=str(e)),
                 )
 
         await asyncio.gather(*(call_one(tid, params) for tid, params in prepared))
@@ -209,10 +245,29 @@ class Executor:
             await self._batch_client.poll_until_done(batch_id)
             results = await self._batch_client.get_results(batch_id)
 
+            errored = []
             for tid, result in results.items():
                 self._resolved[tid] = result
                 if result.content:
                     self._resolved_content[tid] = result.content
+                if result.status == "errored":
+                    errored.append(result)
+
+            if errored:
+                # Check if all errors share the same type — likely a systemic issue
+                error_types = {r.error.type for r in errored if r.error}
+                logger.error(
+                    "Batch %s: %d/%d tasks errored. Error types: %s",
+                    batch_id,
+                    len(errored),
+                    len(results),
+                    error_types,
+                )
+                if error_types & {"authentication_error", "permission_error"}:
+                    raise BatchError(
+                        f"Fatal: batch {batch_id} failed with auth error. "
+                        f"All {len(errored)} errored tasks had: {error_types}"
+                    )
 
     def _resolve_prompt(self, task: LLMTask) -> str:
         """Get the final prompt string for an LLM task."""

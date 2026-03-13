@@ -107,7 +107,8 @@ class TestExecutorIndividualCalls:
         executor = Executor(plan=plan, client=mock_client)
         results = await executor.run()
         assert results["t1"].status == "errored"
-        assert "API down" in results["t1"].error
+        assert results["t1"].error.type == "Exception"
+        assert "API down" in results["t1"].error.message
         assert results["t2"].status == "skipped"
 
     @pytest.mark.asyncio
@@ -239,8 +240,9 @@ class TestExecutorBatchPath:
         plan = compile_graph(g)
 
         async def mock_get_results(batch_id):
+            from batch_compiler.task import TaskError
             return {
-                "a": TaskResult(task_id="a", status="errored", error="API error")
+                "a": TaskResult(task_id="a", status="errored", error=TaskError(type="api_error", message="API error"))
             }
 
         mock_batch = MagicMock()

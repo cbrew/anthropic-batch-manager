@@ -44,12 +44,23 @@ Task = LLMTask | PyTask
 
 
 @dataclass
+class TaskError:
+    """Structured error from the Anthropic API or internal processing."""
+
+    type: str  # e.g. "authentication_error", "invalid_request_error", "internal"
+    message: str
+
+    def __str__(self) -> str:
+        return f"{self.type}: {self.message}"
+
+
+@dataclass
 class TaskResult:
     """The result of executing a single task."""
 
     task_id: str
     status: Literal["succeeded", "errored", "skipped"]
     content: str | None = None
-    error: str | None = None
+    error: TaskError | None = None
+    stop_reason: str | None = None  # "end_turn", "max_tokens", "refusal", etc.
     usage: dict[str, int] | None = None
-    raw_response: dict[str, Any] | None = None

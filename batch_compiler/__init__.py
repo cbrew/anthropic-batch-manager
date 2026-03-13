@@ -10,7 +10,7 @@ from .errors import (
     TemplateError,
 )
 from .graph import TaskGraph
-from .task import LLMTask, PyTask, TaskResult
+from .task import LLMTask, PyTask, TaskError, TaskResult
 
 __all__ = [
     "BatchCompilerError",
@@ -22,6 +22,7 @@ __all__ = [
     "Level",
     "LLMTask",
     "PyTask",
+    "TaskError",
     "TaskGraph",
     "TaskResult",
     "TemplateError",
