@@ -46,25 +46,22 @@ A directed acyclic graph (DAG) of tasks. The compiler validates it is acyclic,
 resolves dependency order, and partitions nodes into **levels** — sets of tasks
 whose dependencies are all satisfied by prior levels.
 
-### k-threshold batching
+### Level-based execution
 
-The executor collects **ready** LLM tasks (all deps resolved) and submits them
-as an Anthropic batch whenever the count reaches a configurable threshold `k`.
-This avoids waiting for an entire level to become ready before dispatching work.
+The executor processes the graph **level by level**. Within each level, all
+tasks have their dependencies satisfied by prior levels:
 
 ```
-Ready queue grows:  [t1, t2, t3, ..., tk]  → submit batch
-Batch completes → new tasks become ready → repeat
+Level 0:  [task_a, task_b, task_c]   ← all independent → one Batch API call
+Level 1:  [task_d, task_e]           ← depend on level-0 → second Batch call
+Level 2:  [task_f]                   ← depends on level-1 → third Batch call
 ```
 
-If fewer than `k` tasks remain and no more can become ready, the executor
-flushes whatever is in the queue as a final batch.
-
-### PyTask execution
-
-PyTasks run **sequentially** in topological order. When a PyTask becomes ready
-(all its deps are resolved), it runs immediately, and its result is added to
-the resolved set — potentially unblocking more LLM tasks for the next batch.
+Within each level:
+- PyTasks run **sequentially** first (fast glue code).
+- All LLM tasks are submitted as Anthropic batch(es), automatically
+  **chunked** to stay within the API limit of 100k requests per batch.
+- The level completes when all batches and PyTasks finish.
 
 ---
 
@@ -103,7 +100,7 @@ g.add(PyTask(
     fn=build_report,   # user-defined function
 ))
 
-results = await g.run(batch_threshold=10)
+results = await g.run()
 print(results["report"])
 ```
 
@@ -168,11 +165,11 @@ results = await g.run()
               ┌────────▼────────┐
               │    Executor     │
               │ ────────────── │
-              │ • k-threshold   │
-              │   batching      │
+              │ • level-by-level│
+              │   dispatch      │
+              │ • auto-chunking │
               │ • sequential    │
               │   PyTask exec   │
-              │ • batch submit  │
               │ • poll / await  │
               │ • result map    │
               └────────┬────────┘
@@ -207,23 +204,19 @@ batch_compiler/
 
 ## Key Design Decisions
 
-### 1. k-threshold batching
+### 1. Level-based execution with chunking
 
-Rather than strict level-by-level execution, the executor maintains a **ready
-queue** of LLM tasks whose deps are all resolved. Whenever the queue reaches
-`k` items (default: 10), those tasks are submitted as a single Anthropic batch.
-When no more tasks can become ready and the queue is non-empty, it flushes.
-
-This is more flexible than pure level-based execution: if a PyTask at level 1
-completes quickly and unlocks several level-2 LLM tasks, those can be batched
-together with remaining level-1 tasks that are still ready.
+The graph executes level by level. All LLM tasks in a level are submitted as
+Anthropic batch(es). If a level has more than 100k tasks, the executor
+automatically chunks them into multiple batches. This maximizes the number of
+requests per batch (better throughput) while respecting API limits.
 
 ### 2. Sequential PyTasks
 
-PyTasks run one at a time in dependency order. This keeps the execution model
-simple and predictable. Since PyTasks are typically fast glue code (aggregation,
-formatting), the overhead of running them serially is negligible compared to
-batch API latency.
+PyTasks run one at a time in dependency order within each level. This keeps the
+execution model simple and predictable. Since PyTasks are typically fast glue
+code (aggregation, formatting), the overhead is negligible compared to batch
+API latency.
 
 ### 3. Template-based prompt composition
 
@@ -283,16 +276,16 @@ The executor returns `dict[str, TaskResult]` keyed by task id.
    b. Topological sort
    c. Assign each node a level = 1 + max(level of deps), roots = level 0
    d. Return ExecutionPlan = list[Level], where Level = list[Task]
-3. Executor runs using k-threshold strategy:
-   a. Initialize ready queue with all level-0 tasks
-   b. Loop until all tasks are resolved:
-      i.   Run any ready PyTasks sequentially, adding results to resolved set
-      ii.  After each PyTask, check if new tasks became ready; add them
-      iii. If ready LLM tasks >= k, submit them as a batch
-      iv.  If no more PyTasks are ready and LLM queue is non-empty, flush batch
-      v.   Poll batch until done; collect results into resolved set
-      vi.  Check for newly ready tasks; goto (i)
-   c. Return full result map
+3. Executor iterates levels 0 → N:
+   a. For each task in the level, check if any dep failed → mark skipped
+   b. Run PyTasks sequentially, collecting results
+   c. For all LLM tasks in the level:
+      - Render prompt templates using resolved results from prior levels
+      - Build batch request items {custom_id: task.id, params: {...}}
+   d. Chunk LLM items into groups of ≤100k, submit each as a batch
+   e. Poll each batch until done; collect results into resolved map
+   f. Advance to next level
+4. Return full result map
 ```
 
 ---
@@ -338,5 +331,4 @@ dev = [
   crashed runs can resume.
 - **Web UI**: visualise the DAG and execution progress.
 - **Conditional tasks**: skip branches based on runtime predicates.
-- **Rate-aware chunking**: split batches with >100k tasks into multiple batches.
 - **Parallel PyTasks**: run independent PyTasks concurrently via asyncio.

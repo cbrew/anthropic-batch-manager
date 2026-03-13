@@ -1,4 +1,4 @@
-"""Executor: run an ExecutionPlan using k-threshold batching."""
+"""Executor: run an ExecutionPlan level-by-level."""
 
 from __future__ import annotations
 
@@ -10,108 +10,73 @@ import anthropic
 from .batch_client import BatchClient
 from .compiler import ExecutionPlan
 from .errors import TemplateError
-from .graph import TaskGraph
 from .task import LLMTask, PyTask, TaskResult
 from .template import render_template
 
 logger = logging.getLogger(__name__)
 
+# Anthropic batch API limit: 100,000 requests per batch
+MAX_BATCH_SIZE = 100_000
+
 
 class Executor:
-    """Execute a compiled plan, batching LLM calls and running PyTasks sequentially."""
+    """Execute a compiled plan level-by-level.
+
+    Within each level:
+    - PyTasks run sequentially first (they're fast glue code).
+    - LLM tasks are submitted as Anthropic batches, chunked to stay within
+      the API limit of 100k requests per batch.
+    - Failed deps propagate as 'skipped' to downstream tasks.
+    """
 
     def __init__(
         self,
         plan: ExecutionPlan,
-        graph: TaskGraph,
-        batch_threshold: int = 10,
         client: anthropic.AsyncAnthropic | None = None,
+        max_batch_size: int = MAX_BATCH_SIZE,
     ) -> None:
         self._plan = plan
-        self._graph = graph
-        self._batch_threshold = batch_threshold
         self._batch_client = BatchClient(client=client)
+        self._max_batch_size = max_batch_size
 
         # State
         self._resolved: dict[str, TaskResult] = {}
         self._resolved_content: dict[str, str] = {}  # task_id -> output text
 
     async def run(self) -> dict[str, TaskResult]:
-        """Execute the full plan and return results for all tasks."""
+        """Execute all levels and return results for every task."""
         tasks = self._plan.tasks
 
-        # Build dependency tracking
-        remaining: set[str] = set(tasks.keys())
-        dependents: dict[str, list[str]] = {tid: [] for tid in tasks}
-        for tid, task in tasks.items():
-            for dep_id in task.deps:
-                dependents[dep_id].append(tid)
+        for level in self._plan.levels:
+            py_ids: list[str] = []
+            llm_ids: list[str] = []
 
-        # Find initially ready tasks (no deps)
-        ready_llm: list[str] = []
-        ready_py: list[str] = []
+            for tid in level.task_ids:
+                task = tasks[tid]
 
-        for tid in remaining:
-            task = tasks[tid]
-            if not task.deps:
-                if isinstance(task, LLMTask):
-                    ready_llm.append(tid)
-                else:
-                    ready_py.append(tid)
-
-        while remaining:
-            progress = False
-
-            # 1. Run ready PyTasks sequentially
-            while ready_py:
-                py_id = ready_py.pop(0)
-                if py_id not in remaining:
-                    continue
-                await self._run_pytask(py_id, tasks[py_id])
-                remaining.discard(py_id)
-                progress = True
-
-                # Check if this unlocked new tasks
-                for dep_tid in dependents[py_id]:
-                    self._enqueue_or_skip(
-                        dep_tid, tasks, remaining, ready_llm, ready_py
-                    )
-
-            # 2. Batch LLM tasks when we have enough (or it's all that's left)
-            if ready_llm:
-                # Flush if >= k, or if no more PyTasks can run and these are
-                # the only way to make progress
-                if len(ready_llm) >= self._batch_threshold or not ready_py:
-                    batch_ids = list(ready_llm)
-                    ready_llm.clear()
-
-                    await self._run_llm_batch(batch_ids, tasks)
-
-                    for tid in batch_ids:
-                        remaining.discard(tid)
-                    progress = True
-
-                    # Check for newly ready tasks
-                    for tid in batch_ids:
-                        for dep_tid in dependents[tid]:
-                            self._enqueue_or_skip(
-                                dep_tid, tasks, remaining, ready_llm, ready_py
-                            )
-
-            if not progress:
-                # No progress possible — remaining tasks have unresolvable deps
-                for tid in remaining:
+                # Skip if any dep failed
+                if self._any_dep_failed(task):
                     self._resolved[tid] = TaskResult(
                         task_id=tid,
                         status="skipped",
-                        error="Dependencies could not be resolved",
+                        error="Dependency failed",
                     )
-                break
+                    continue
+
+                if isinstance(task, PyTask):
+                    py_ids.append(tid)
+                else:
+                    llm_ids.append(tid)
+
+            # Run PyTasks sequentially
+            for tid in py_ids:
+                await self._run_pytask(tid, tasks[tid])
+
+            # Submit LLM tasks as batches (chunked for API limits)
+            if llm_ids:
+                await self._run_llm_level(llm_ids, tasks)
 
         return dict(self._resolved)
-
-    def _all_deps_resolved(self, task: LLMTask | PyTask) -> bool:
-        return all(dep_id in self._resolved for dep_id in task.deps)
 
     def _any_dep_failed(self, task: LLMTask | PyTask) -> bool:
         """Check if any dependency errored or was skipped."""
@@ -121,37 +86,8 @@ class Executor:
             for dep_id in task.deps
         )
 
-    def _enqueue_or_skip(
-        self,
-        tid: str,
-        tasks: dict[str, Any],
-        remaining: set[str],
-        ready_llm: list[str],
-        ready_py: list[str],
-    ) -> None:
-        """Add a ready task to the appropriate queue, or skip if deps failed."""
-        if tid not in remaining:
-            return
-        task = tasks[tid]
-        if not self._all_deps_resolved(task):
-            return
-        if self._any_dep_failed(task):
-            self._resolved[tid] = TaskResult(
-                task_id=tid,
-                status="skipped",
-                error="Dependency failed",
-            )
-            remaining.discard(tid)
-            return
-        if isinstance(task, LLMTask):
-            ready_llm.append(tid)
-        else:
-            ready_py.append(tid)
-
-    async def _run_pytask(
-        self, task_id: str, task: PyTask  # type: ignore[type-arg]
-    ) -> None:
-        """Run a single PyTask sequentially."""
+    async def _run_pytask(self, task_id: str, task: PyTask) -> None:
+        """Run a single PyTask."""
         logger.info("Running PyTask: %s", task_id)
         try:
             dep_results = {
@@ -170,12 +106,11 @@ class Executor:
                 task_id=task_id, status="errored", error=str(e)
             )
 
-    async def _run_llm_batch(
+    async def _run_llm_level(
         self, task_ids: list[str], tasks: dict[str, Any]
     ) -> None:
-        """Build and submit a batch of LLM tasks, poll, and collect results."""
-        batch_items = []
-        skipped: list[str] = []
+        """Build batch items for all LLM tasks in a level, chunk, and submit."""
+        batch_items: list[tuple[str, dict[str, Any]]] = []
 
         for tid in task_ids:
             task: LLMTask = tasks[tid]
@@ -186,7 +121,6 @@ class Executor:
                 self._resolved[tid] = TaskResult(
                     task_id=tid, status="errored", error=str(e)
                 )
-                skipped.append(tid)
                 continue
 
             messages = [{"role": "user", "content": prompt}]
@@ -200,21 +134,31 @@ class Executor:
             if task.temperature is not None:
                 params["temperature"] = task.temperature
 
-            batch_items.append({"custom_id": tid, "params": params})
+            batch_items.append((tid, {"custom_id": tid, "params": params}))
 
         if not batch_items:
             return
 
-        logger.info("Submitting batch with %d LLM tasks", len(batch_items))
+        # Chunk into batches of max_batch_size
+        for chunk_start in range(0, len(batch_items), self._max_batch_size):
+            chunk = batch_items[chunk_start : chunk_start + self._max_batch_size]
+            items = [item for _, item in chunk]
 
-        batch_id = await self._batch_client.submit_batch(batch_items)
-        await self._batch_client.poll_until_done(batch_id)
-        results = await self._batch_client.get_results(batch_id)
+            logger.info(
+                "Submitting batch with %d LLM tasks (chunk %d/%d)",
+                len(items),
+                chunk_start // self._max_batch_size + 1,
+                (len(batch_items) + self._max_batch_size - 1) // self._max_batch_size,
+            )
 
-        for tid, result in results.items():
-            self._resolved[tid] = result
-            if result.content:
-                self._resolved_content[tid] = result.content
+            batch_id = await self._batch_client.submit_batch(items)
+            await self._batch_client.poll_until_done(batch_id)
+            results = await self._batch_client.get_results(batch_id)
+
+            for tid, result in results.items():
+                self._resolved[tid] = result
+                if result.content:
+                    self._resolved_content[tid] = result.content
 
     def _resolve_prompt(self, task: LLMTask) -> str:
         """Get the final prompt string for an LLM task."""

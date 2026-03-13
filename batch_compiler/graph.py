@@ -114,14 +114,14 @@ class TaskGraph:
 
     async def run(
         self,
-        batch_threshold: int = 10,
         client: Any | None = None,
+        max_batch_size: int = 100_000,
     ) -> dict[str, Any]:
         """Compile and execute the graph.
 
         Args:
-            batch_threshold: Submit a batch when this many LLM tasks are ready.
             client: Optional anthropic.AsyncAnthropic client instance.
+            max_batch_size: Max requests per Anthropic batch (default 100k).
 
         Returns:
             Dict mapping task_id -> TaskResult.
@@ -132,8 +132,7 @@ class TaskGraph:
         plan = compile_graph(self)
         executor = Executor(
             plan=plan,
-            graph=self,
-            batch_threshold=batch_threshold,
             client=client,
+            max_batch_size=max_batch_size,
         )
         return await executor.run()

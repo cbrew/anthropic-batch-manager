@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -41,8 +41,7 @@ class TestExecutor:
         plan = compile_graph(g)
 
         mock_client = _make_mock_batch_client({"t1": "World"})
-
-        executor = Executor(plan=plan, graph=g, batch_threshold=1)
+        executor = Executor(plan=plan)
         executor._batch_client = mock_client
 
         results = await executor.run()
@@ -56,7 +55,7 @@ class TestExecutor:
         g.add(PyTask(id="py1", fn=lambda deps: "computed"))
         plan = compile_graph(g)
 
-        executor = Executor(plan=plan, graph=g)
+        executor = Executor(plan=plan)
         results = await executor.run()
         assert results["py1"].status == "succeeded"
         assert results["py1"].content == "computed"
@@ -73,7 +72,7 @@ class TestExecutor:
         plan = compile_graph(g)
 
         mock_client = _make_mock_batch_client({"llm1": "Answer"})
-        executor = Executor(plan=plan, graph=g, batch_threshold=1)
+        executor = Executor(plan=plan)
         executor._batch_client = mock_client
 
         results = await executor.run()
@@ -82,6 +81,7 @@ class TestExecutor:
 
     @pytest.mark.asyncio
     async def test_fan_out_batching(self):
+        """All independent tasks at level 0 go in one batch."""
         g = TaskGraph()
         for i in range(5):
             g.add(LLMTask(id=f"t{i}", prompt=f"Task {i}"))
@@ -90,14 +90,31 @@ class TestExecutor:
         responses = {f"t{i}": f"Result {i}" for i in range(5)}
         mock_client = _make_mock_batch_client(responses)
 
-        # batch_threshold=3 but all 5 are ready, so should flush
-        executor = Executor(plan=plan, graph=g, batch_threshold=3)
+        executor = Executor(plan=plan)
         executor._batch_client = mock_client
 
         results = await executor.run()
         assert all(results[f"t{i}"].status == "succeeded" for i in range(5))
-        # Should have been submitted as a single batch (all at level 0)
         mock_client.submit_batch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_chunking_large_batch(self):
+        """Batches exceeding max_batch_size are chunked."""
+        g = TaskGraph()
+        for i in range(5):
+            g.add(LLMTask(id=f"t{i}", prompt=f"Task {i}"))
+        plan = compile_graph(g)
+
+        responses = {f"t{i}": f"Result {i}" for i in range(5)}
+        mock_client = _make_mock_batch_client(responses)
+
+        # Set max_batch_size=2 so 5 tasks require 3 chunks
+        executor = Executor(plan=plan, max_batch_size=2)
+        executor._batch_client = mock_client
+
+        results = await executor.run()
+        assert all(results[f"t{i}"].status == "succeeded" for i in range(5))
+        assert mock_client.submit_batch.call_count == 3
 
     @pytest.mark.asyncio
     async def test_two_level_pipeline(self):
@@ -106,8 +123,8 @@ class TestExecutor:
         g.add(LLMTask(id="b", prompt_template="Step 2: {a}", deps=["a"]))
         plan = compile_graph(g)
 
-        # Need to handle two batch submissions
         call_count = 0
+
         async def mock_get_results(batch_id):
             nonlocal call_count
             call_count += 1
@@ -121,7 +138,7 @@ class TestExecutor:
         mock_client.poll_until_done = AsyncMock()
         mock_client.get_results = AsyncMock(side_effect=mock_get_results)
 
-        executor = Executor(plan=plan, graph=g, batch_threshold=1)
+        executor = Executor(plan=plan)
         executor._batch_client = mock_client
 
         results = await executor.run()
@@ -146,10 +163,9 @@ class TestExecutor:
         mock_client.poll_until_done = AsyncMock()
         mock_client.get_results = AsyncMock(side_effect=mock_get_results)
 
-        executor = Executor(plan=plan, graph=g, batch_threshold=1)
+        executor = Executor(plan=plan)
         executor._batch_client = mock_client
 
         results = await executor.run()
         assert results["a"].status == "errored"
-        # b should be skipped since its dep failed
         assert results["b"].status == "skipped"
