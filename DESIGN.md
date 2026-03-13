@@ -17,8 +17,8 @@ price reduction** and high throughput, but requires the caller to manually
 assemble flat lists of requests.
 
 **The task graph compiler bridges this gap**: you write tasks in natural serial
-form, and it compiles them into a dependency graph, groups independent nodes
-into batch API calls, and executes the graph level-by-level.
+form, and it compiles them into a dependency graph, identifies independent LLM
+calls, and batches them together when enough are ready.
 
 ---
 
@@ -46,18 +46,24 @@ A directed acyclic graph (DAG) of tasks. The compiler validates it is acyclic,
 resolves dependency order, and partitions nodes into **levels** — sets of tasks
 whose dependencies are all satisfied by prior levels.
 
-### Execution plan
+### Level-based execution
+
+The executor processes the graph **level by level**. Within each level, all
+tasks have their dependencies satisfied by prior levels:
 
 ```
-Level 0:  [task_a, task_b, task_c]   ← all independent → one Batch API call
-Level 1:  [task_d, task_e]           ← depend on level-0 → second Batch call
-Level 2:  [task_f]                   ← depends on level-1 → third Batch call
+Level 0:  [task_a, task_b, task_c]   ← all independent
+Level 1:  [task_d, task_e]           ← depend on level-0
+Level 2:  [task_f]                   ← depends on level-1
 ```
 
 Within each level:
-- All `LLMTask` nodes are submitted as a **single Anthropic batch**.
-- All `PyTask` nodes run concurrently via `asyncio`.
-- The level completes when both the batch and all PyTasks finish.
+- PyTasks run **sequentially** first (fast glue code).
+- **< 10 LLM tasks**: fired as concurrent individual `messages.create` calls
+  (avoids Batch API overhead for small workloads).
+- **≥ 10 LLM tasks**: submitted via the Batch API, automatically **chunked**
+  to stay within the API limit of 100k requests per batch.
+- The level completes when all calls finish.
 
 ---
 
@@ -161,12 +167,13 @@ results = await g.run()
               ┌────────▼────────┐
               │    Executor     │
               │ ────────────── │
-              │ • per-level     │
+              │ • level-by-level│
               │   dispatch      │
-              │ • batch submit  │
+              │ • auto-chunking │
+              │ • sequential    │
+              │   PyTask exec   │
               │ • poll / await  │
               │ • result map    │
-              │ • retry logic   │
               └────────┬────────┘
                        │
               ┌────────▼────────┐
@@ -199,14 +206,21 @@ batch_compiler/
 
 ## Key Design Decisions
 
-### 1. Level-based execution (not streaming)
+### 1. Adaptive dispatch: individual calls vs Batch API
 
-The graph executes **level by level**. All tasks in a level are submitted as one
-batch, and we wait for the entire batch to complete before advancing. This is
-simpler than streaming partial results and matches the Batch API's semantics
-(results arrive when the batch ends).
+Small levels (< 10 LLM tasks) use concurrent `messages.create` calls — lower
+latency, no polling overhead. Larger levels use the Batch API for throughput,
+automatically chunked into groups of ≤ 100k to respect API limits. The
+threshold (default 10) is configurable via `batch_threshold`.
 
-### 2. Template-based prompt composition
+### 2. Sequential PyTasks
+
+PyTasks run one at a time in dependency order within each level. This keeps the
+execution model simple and predictable. Since PyTasks are typically fast glue
+code (aggregation, formatting), the overhead is negligible compared to batch
+API latency.
+
+### 3. Template-based prompt composition
 
 When a task depends on earlier tasks, its prompt is built by substituting
 dependency results into a template string:
@@ -220,18 +234,12 @@ prompt_template="Classify:\n\n{summarize-3}"
 Templates use Python's `str.format_map` with a dict of resolved results.
 Unresolved references raise `TemplateError` at compile time.
 
-### 3. `foreach` fan-out
+### 4. `foreach` fan-out
 
 The YAML `foreach` key expands a single task definition into N tasks, one per
 item. Each gets an auto-generated id like `summarize[0]`, `summarize[1]`, etc.
 Dependencies can reference `task[{index}]` for matched fan-out or `task[*]` for
 fan-in (depend on all expanded tasks).
-
-### 4. Mixed LLM + Python tasks
-
-Not every step needs an LLM. `PyTask` lets users insert arbitrary transforms
-(aggregation, filtering, formatting) into the graph. PyTasks within a level
-run as `asyncio` tasks concurrently with the batch API call for that level.
 
 ### 5. Retry and error handling
 
@@ -271,16 +279,15 @@ The executor returns `dict[str, TaskResult]` keyed by task id.
    c. Assign each node a level = 1 + max(level of deps), roots = level 0
    d. Return ExecutionPlan = list[Level], where Level = list[Task]
 3. Executor iterates levels 0 → N:
-   a. For each LLMTask in the level:
-      - Render prompt template using resolved results from prior levels
-      - Build batch request item {custom_id: task.id, params: {...}}
-   b. Submit all LLMTask items as one Anthropic batch
-   c. Run all PyTask callables concurrently (passing resolved deps)
-   d. Poll batch until processing_status == "ended"
-   e. Retrieve batch results, map custom_id → TaskResult
-   f. Merge PyTask results into the result map
-   g. Advance to next level
-4. Return full result map to user
+   a. For each task in the level, check if any dep failed → mark skipped
+   b. Run PyTasks sequentially, collecting results
+   c. For all LLM tasks in the level:
+      - Render prompt templates using resolved results from prior levels
+      - Build batch request items {custom_id: task.id, params: {...}}
+   d. Chunk LLM items into groups of ≤100k, submit each as a batch
+   e. Poll each batch until done; collect results into resolved map
+   f. Advance to next level
+4. Return full result map
 ```
 
 ---
@@ -294,7 +301,7 @@ requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
     "pyyaml>=6.0",
-    "jinja2>=3.1",          # for richer templates in YAML mode
+    "jinja2>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -320,10 +327,10 @@ dev = [
 
 ## Future Extensions (out of scope for v1)
 
-- **Streaming partial results**: start level N+1 tasks as soon as their
-  specific deps resolve, without waiting for the full batch.
+- **Streaming partial results**: start next tasks as soon as their
+  specific deps resolve within a batch, without waiting for the full batch.
 - **Persistent state / checkpointing**: save intermediate results to disk so
   crashed runs can resume.
 - **Web UI**: visualise the DAG and execution progress.
 - **Conditional tasks**: skip branches based on runtime predicates.
-- **Rate-aware chunking**: split levels with >100k tasks into multiple batches.
+- **Parallel PyTasks**: run independent PyTasks concurrently via asyncio.
