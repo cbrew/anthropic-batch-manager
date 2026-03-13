@@ -67,7 +67,19 @@ async def run_trial(
     elapsed = time.monotonic() - t0
 
     succeeded = sum(1 for r in results.values() if r.status == "succeeded")
-    errored = sum(1 for r in results.values() if r.status == "errored")
+    errored_results = [r for r in results.values() if r.status == "errored"]
+    errored = len(errored_results)
+
+    if errored:
+        error_types = {r.error.type for r in errored_results if r.error}
+        logger.warning(
+            "Trial %d tasks k=%d: %d/%d errored. Types: %s",
+            n_tasks, threshold, errored, len(results), error_types,
+        )
+        # Log first few error details
+        for r in errored_results[:3]:
+            logger.warning("  %s: %s", r.task_id, r.error)
+
     input_tok = sum(
         (r.usage or {}).get("input_tokens", 0) for r in results.values()
     )
